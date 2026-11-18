@@ -4,8 +4,10 @@
 """
 from __future__ import annotations
 
+import copy
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Any
+from typing import Any, Iterator
 
 from app.seed import SEED_ROWS
 
@@ -29,6 +31,14 @@ class Store:
         self._archive_records: list[dict[str, Any]] = []
         # 补数区间记录
         self._backfill_partitions: dict[str, list[dict[str, Any]]] = {}
+        # 清洗规则执行报告: "报告编号" -> 完整报告（含规则明细、冲突判定、两种历史视图）
+        self._cleanse_reports: dict[str, dict[str, Any]] = {}
+        # 报告对应的清洗结果行: "报告编号" -> rows
+        self._cleanse_rows: dict[str, list[dict[str, Any]]] = {}
+        # DWD刷新标记流水（与报告、规则顺序同事务写入）
+        self._dwd_refresh_log: list[dict[str, Any]] = []
+        # 报告编号自增序列
+        self._report_seq = 0
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)
@@ -50,6 +60,76 @@ class Store:
 
     def find_all_by_field(self, module: str, field: str, value: Any) -> list[dict[str, Any]]:
         return [row for row in self.rows(module) if row.get(field) == value]
+
+    # ---- 事务 ----
+
+    def snapshot_state(self) -> dict[str, Any]:
+        """深拷贝所有可变状态，用于事务回滚。
+
+        规则顺序、DWD刷新标记和清洗报告必须一起落库；任何一步失败都恢复到
+        事务开始前的状态，避免出现"报告已保存、明细还是旧口径"的中间态。
+        """
+        return {
+            "_tables": copy.deepcopy(self._tables),
+            "_table_data": copy.deepcopy(self._table_data),
+            "_versions": copy.deepcopy(self._versions),
+            "_lineage_edges": copy.deepcopy(self._lineage_edges),
+            "_quality_results": copy.deepcopy(self._quality_results),
+            "_snapshot_data": copy.deepcopy(self._snapshot_data),
+            "_archive_records": copy.deepcopy(self._archive_records),
+            "_backfill_partitions": copy.deepcopy(self._backfill_partitions),
+            "_cleanse_reports": copy.deepcopy(self._cleanse_reports),
+            "_cleanse_rows": copy.deepcopy(self._cleanse_rows),
+            "_dwd_refresh_log": copy.deepcopy(self._dwd_refresh_log),
+            "_report_seq": self._report_seq,
+        }
+
+    def restore_state(self, payload: dict[str, Any]) -> None:
+        for key, value in payload.items():
+            setattr(self, key, value)
+
+    @contextmanager
+    def transaction(self) -> Iterator["Store"]:
+        """简易事务：正常退出即提交，异常时整体回滚并继续抛出。"""
+        saved = self.snapshot_state()
+        try:
+            yield self
+        except Exception:
+            self.restore_state(saved)
+            raise
+
+    # ---- 清洗规则执行报告 ----
+
+    def next_report_no(self) -> str:
+        self._report_seq += 1
+        return f"CLNRPT-{datetime.now().strftime('%Y%m%d')}-{self._report_seq:04d}"
+
+    def save_cleanse_report(self, report: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+        report_no = str(report.get("报告编号", ""))
+        self._cleanse_reports[report_no] = copy.deepcopy(report)
+        self._cleanse_rows[report_no] = [dict(row) for row in rows]
+
+    def list_cleanse_reports(self) -> list[dict[str, Any]]:
+        # 按生成顺序返回，最近生成的排在前面
+        reports = list(self._cleanse_reports.values())
+        reports.sort(key=lambda item: str(item.get("生成时间", "")), reverse=True)
+        return copy.deepcopy(reports)
+
+    def get_cleanse_report(self, report_no: str) -> dict[str, Any] | None:
+        report = self._cleanse_reports.get(report_no)
+        return copy.deepcopy(report) if report else None
+
+    def get_cleanse_report_rows(self, report_no: str) -> list[dict[str, Any]]:
+        return copy.deepcopy(self._cleanse_rows.get(report_no, []))
+
+    def add_dwd_refresh_log(self, record: dict[str, Any]) -> None:
+        self._dwd_refresh_log.append(dict(record))
+
+    def get_dwd_refresh_log(self, report_no: str | None = None) -> list[dict[str, Any]]:
+        records = self._dwd_refresh_log
+        if report_no:
+            records = [item for item in records if item.get("报告编号") == report_no]
+        return [dict(item) for item in records]
 
     def overview(self) -> dict[str, object]:
         modules: list[dict[str, object]] = []

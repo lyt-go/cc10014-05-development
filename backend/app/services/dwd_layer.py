@@ -69,7 +69,11 @@ class DwdLayerService:
         return entry, f"明细表已{action}"
 
     def build_dwd_from_ods(self, entry_id: int) -> dict[str, Any]:
-        """从关联的ODS表读取数据，应用清洗+去重，写入DWD模拟表。"""
+        """从关联的ODS表读取数据，按执行顺序整组清洗+去重，写入DWD模拟表。
+
+        整组清洗会同时生成清洗规则执行报告；报告、规则顺序与刷新标记同事务落库，
+        构建成功后清掉该DWD表的待刷新标记，刷新原因保留为本次报告口径。
+        """
         entry = self.get_entry(entry_id)
         if not entry:
             return {"ok": False, "message": "明细表不存在"}
@@ -88,14 +92,18 @@ class DwdLayerService:
             # 如果ODS没有数据，用seed数据生成模拟数据
             ods_data = self._mock_ods_data(ods_table)
             store.set_table_rows(ods_table, ods_data)
-        # 应用清洗
-        cleanse_id = entry.get("清洗策略", "")
-        if cleanse_id:
-            from app.services.cleanse_rule import CleanseRuleService
-            cs = CleanseRuleService()
-            c_entry = store.find("cleanse_rule", self._resolve_id("cleanse_rule", cleanse_id))
-            if c_entry:
-                ods_data = cs.apply_cleanse(c_entry["id"], ods_data)
+        # 整组清洗：按执行顺序逐条执行并生成清洗规则执行报告
+        from app.services.cleanse_rule import CleanseRuleService
+        cs = CleanseRuleService()
+        # 明细表上显式关联的清洗策略即使没填目标数据集，也要进入本表的清洗链
+        cleanse_code = entry.get("清洗策略", "")
+        report = cs.execute_group(
+            ods_table, data_rows=ods_data,
+            timeout_seconds=self._report_timeout(), dwd_entry_id=entry_id,
+            rule_codes=[cleanse_code] if cleanse_code else None)
+        if not report.get("ok"):
+            return {"ok": False, "message": report.get("message", "清洗规则执行报告生成失败")}
+        ods_data = report.get("清洗后数据", ods_data)
         # 应用去重
         dedup_id = entry.get("去重配置", "")
         if dedup_id:
@@ -108,11 +116,23 @@ class DwdLayerService:
         dwd_table = entry.get("表名称", "")
         store.set_table_rows(dwd_table, ods_data)
         entry["刷新水位"] = date.today().isoformat()
+        entry["待刷新"] = False
+        entry["最近报告"] = report.get("报告编号", "")
+        entry["刷新原因"] = report.get("清洗口径摘要", entry.get("刷新原因", ""))
         store.save_version(MODULE, entry_id, entry)
         # 注册血缘
         store.add_lineage(ods_table, dwd_table, ods_entry.get("字段列表", ""),
                           transform_logic="清洗+去重", batch_id=entry.get("创建批次", ""))
-        return {"ok": True, "message": f"DWD表 {dwd_table} 已生成，共{len(ods_data)}行"}
+        return {
+            "ok": True,
+            "message": f"DWD表 {dwd_table} 已生成，共{len(ods_data)}行；清洗规则执行报告 {report.get('报告编号', '')}",
+            "报告编号": report.get("报告编号", ""),
+            "报告": report.get("报告", {}),
+        }
+
+    def _report_timeout(self) -> float:
+        from app.config import settings
+        return settings.cleanse_report_timeout_seconds
 
     def _resolve_id(self, module: str, code: str) -> int:
         for row in store.rows(module):

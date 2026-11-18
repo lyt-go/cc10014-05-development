@@ -30,13 +30,13 @@
     <table class="data-table">
       <thead>
         <tr>
-          <th v-for="column in columns" :key="column">{{ column }}</th>
+          <th v-for="column in displayColumns" :key="column">{{ column }}</th>
           <th>可执行动作</th>
         </tr>
       </thead>
       <tbody>
         <tr v-for="row in rows" :key="String(row.id)" :data-testid="`row-${row.id}`" :data-status="String(row.status)">
-          <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
+          <td v-for="column in displayColumns" :key="column">{{ formatCell(row, column) }}</td>
           <td class="row-actions">
             <button
               v-for="action in actions"
@@ -48,10 +48,12 @@
             >
               {{ action }}
             </button>
+            <button class="link" type="button" :data-testid="`build-${row.id}`" @click="buildRow(row)">构建明细</button>
+            <button class="link" type="button" :data-testid="`report-link-${row.id}`" @click="openReport(row)">清洗报告</button>
           </td>
         </tr>
         <tr v-if="!rows.length">
-          <td :colspan="columns.length + 1" class="empty-state">暂无明细层管理数据，可先登记明细表</td>
+          <td :colspan="displayColumns.length + 1" class="empty-state">暂无明细层管理数据，可先登记明细表</td>
         </tr>
       </tbody>
     </table>
@@ -74,6 +76,7 @@
 
     <footer class="page-foot">
       <span>共 {{ total }} 条明细层管理记录</span>
+      <span v-if="noticeMessage" class="notice-text" data-testid="build-result">{{ noticeMessage }}</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
   </section>
@@ -81,13 +84,18 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 
 import { request } from '@/api/client'
 
-type Row = Record<string, string | number | null>
+type Row = Record<string, string | number | null | boolean>
 
 const ENDPOINT = '/api/dwd_layer'
+const router = useRouter()
 const columns = ["表编号", "父层来源", "表名称", "粒度说明", "分区字段", "关联键列", "刷新水位", "创建批次"]
+// 列表额外展示刷新标记与最近报告，方便进入清洗规则执行报告详情逐字段核对
+const extraColumns = ["刷新状态", "最近清洗报告"]
+const displayColumns = [...columns, ...extraColumns]
 const actions = ["提交校验", "确认上线", "标记下线"]
 const statuses = ["草稿", "待校验", "已上线", "已下线"]
 const metricNames = ["明细表总数", "待校验表", "已上线表"]
@@ -95,6 +103,7 @@ const metricNames = ["明细表总数", "待校验表", "已上线表"]
 const rows = ref<Row[]>([])
 const total = ref(0)
 const errorMessage = ref('')
+const noticeMessage = ref('')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
 const showCreate = ref(false)
@@ -168,6 +177,60 @@ async function runAction(action: string, row: Row) {
   }
 }
 
+function formatCell(row: Row, column: string): string {
+  if (column === '刷新状态') {
+    if (row['待刷新']) return '待刷新'
+    return row['最近报告'] ? '已按报告刷新' : '—'
+  }
+  if (column === '最近清洗报告') return String(row['最近报告'] ?? '—')
+  return String(row[column] ?? '—')
+}
+
+async function buildRow(row: Row) {
+  errorMessage.value = ''
+  noticeMessage.value = ''
+  try {
+    const response = await request(`${ENDPOINT}/${row.id}/build`, { method: 'POST', body: '{}' })
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) throw new Error(payload.message || '明细构建失败')
+    noticeMessage.value = payload.message
+    await reload()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '明细构建失败'
+  }
+}
+
+async function openReport(row: Row) {
+  errorMessage.value = ''
+  const reportNo = String(row['最近报告'] ?? '')
+  if (reportNo) {
+    await router.push(`/cleanse_rule/reports/${reportNo}`)
+    return
+  }
+  // 没有报告时按父层ODS表名找该数据集最近一份报告，找不到提示先执行清洗
+  try {
+    let dataset = String(row['父层来源'] ?? '')
+    const odsResponse = await request(`/api/ods_layer?size=200`)
+    if (odsResponse.ok) {
+      const odsPayload = await odsResponse.json()
+      const ods = (odsPayload.items ?? []).find((item: any) =>
+        item['表编号'] === row['父层来源'] || item['表名称'] === row['父层来源'])
+      if (ods) dataset = String(ods['表名称'] ?? dataset)
+    }
+    const response = await request(`/api/cleanse_rule/reports?dataset=${encodeURIComponent(dataset)}`)
+    if (!response.ok) throw new Error('清洗规则执行报告读取失败')
+    const payload = await response.json()
+    const latest = payload.items?.[0]
+    if (!latest) {
+      errorMessage.value = '该明细表还没有清洗规则执行报告，请先构建明细或执行整组清洗'
+      return
+    }
+    await router.push(`/cleanse_rule/reports/${latest['报告编号']}`)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '清洗规则执行报告读取失败'
+  }
+}
+
 async function reload() {
   errorMessage.value = ''
   const query = new URLSearchParams(filters.value as Record<string, string>).toString()
@@ -186,3 +249,7 @@ async function reload() {
 
 onMounted(reload)
 </script>
+
+<style scoped>
+.notice-text { color: #067647; }
+</style>
